@@ -155,7 +155,6 @@ bool ClientPrivate::SetMetaFile(const std::string &path) {
             hash_lengths.push_back(std::stoi(len_value));
 
             if(hash_lengths.size() != 3) {
-                std::cout << "Invalid hash lengths";
                 return false;
             }
 

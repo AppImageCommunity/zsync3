@@ -60,7 +60,11 @@ bool ClientPrivate::SetMetaFile(const std::string &path) {
         std::fill(buffer.begin(), buffer.end(), '\0');
 
         meta_file->getline(buffer.data(), buf_size);
-        std::string line(buffer.data());
+        if(meta_file->fail()) {
+		return false;
+	}
+
+	std::string line(buffer.data());
 
         if(line.length() == 0) {
             ///// 0x0a 0x0a represents two new lines which proves the start of
@@ -110,8 +114,13 @@ bool ClientPrivate::SetMetaFile(const std::string &path) {
                 //// Get hash entry and fill in required data.
                 HashEntry *e = &(block_hashes->at(id));
                 e->block_id = id;
-                e->rsum = RollingChecksum(rsum_buffer[0], rsum_buffer[1]);
-                e->md4 = std::string(md4_buffer.data());
+		e->rsum = RollingChecksum(rsum_buffer[0], rsum_buffer[1]);
+		//// For hashing we need the b of the next rsum so we store
+		//// it.
+		if(num_seq_matches > 1 && id > 0) {
+			block_hashes->at(id - 1).rsum.nb = e->rsum.b;
+		}
+                e->md4 = md4_buffer;
             }
             break;
         }
@@ -137,9 +146,6 @@ bool ClientPrivate::SetMetaFile(const std::string &path) {
             mtime = header_value; //// For now MTime is not needed that much.
         } else if(header == "blocksize") { /// Get blocksize
             blocksize = std::stoi(header_value);  /// Convert to integer.
-            blockshift = (blocksize == 1024) ? 10 :
-                         (blocksize == 2048) ? 11 :
-                         log2(blocksize);
         } else if(header == "length") { /// Set file length
             target_file_length = std::stoi(header_value);
         } else if(header == "hash-lengths") { //// Set weak checksum bytes and strong checksum bytes
@@ -172,6 +178,12 @@ bool ClientPrivate::SetMetaFile(const std::string &path) {
     ///// Build the Rsum Mapping.
     BuildRsumHashTable();
 
+    ///// Calculate and Set Precalculated Values.
+    context = blocksize * num_seq_matches;
+    blockshift = (blocksize == 1024) ? 10 :
+                 (blocksize == 2048) ? 11 :
+                 log2(blocksize);
+       
     //// Construct temporary files.
 
     return true;
@@ -185,10 +197,8 @@ bool ClientPrivate::SubmitSeedFile(const std::string &path) {
         return false;
     }
 
-    const int64_t bufsize = blocksize * 16;
-    const int64_t context = blocksize * num_seq_matches;
-
-    int64_t in = 0;
+    const int bufsize = blocksize * 16;
+    int in = 0;
 
     std::vector<char> buffer;
     buffer.resize(bufsize + context);
@@ -230,20 +240,14 @@ bool ClientPrivate::SubmitSeedFile(const std::string &path) {
 
 int64_t ClientPrivate::SubmitSourceData(const char *buffer, size_t len, int64_t start) {
     //// TODO: implement this with all the variables in this method scope.
-}
-
-uint32_t Zsync3::ClientPrivate::RsumHash(HashEntry &entry) {
-    //// Note: The next rsum is needed if more than 1 block has to be
-    ////       matched.
-    uint32_t h = entry.rsum.GetB();
-
-    h ^= ((num_seq_matches > 1) ? block_hashes->at(entry.block_id + 1).rsum.GetB()
-          : entry.rsum.GetA() & weak_checksum_mask) << kBitHashBits;
-    return h;
+    (void)buffer;
+    (void)len;
+    (void)start; 
+    return 0;
 }
 
 bool ClientPrivate::BuildRsumHashTable() {
-    int64_t i = 16;
+    int i = 16; /// Mapping should be inside the possible values of Addler-32's first 16 bits.
     //// We step down i till we have sufficient number to hold all blocks
     //// Order of the hash table is 2^i such that i is minimum which can all blocks
     //// and not less than 4.
@@ -251,38 +255,27 @@ bool ClientPrivate::BuildRsumHashTable() {
         i--;
     }
 
+    hash_mask = (2 << i) - 1;
+
+    //// Initialize the hasher.
+    auto hasher = RollingChecksumHasher(weak_checksum_mask, hash_mask, num_seq_matches);
+
     //// Allocate the rsum hash tables based on rsum.
     try {
-        hash_mask = (2 << i) - 1;
-        rsum_mapping.reset(new std::vector<HashEntry*>);
-        rsum_mapping->resize(hash_mask + 1);
-        std::fill(rsum_mapping->begin(), rsum_mapping->end(), nullptr);
+        rsum_map.reset(
+		new std::unordered_multimap<RollingChecksum, HashEntry*, RollingChecksumHasher, RollingChecksumEqual> (
+			(int)(hash_mask + 1),
+			hasher
+		)	
+	);
     } catch(...) {
         return false;
     }
 
-    //// Allocate bit hash table based on rsum.
-    try {
-        bit_hash_mask = (2 << (i + kBitHashBits)) - 1;
-        bit_hashes.reset(new std::vector<uint8_t>);
-        bit_hashes->resize(bit_hash_mask + 1);
-        std::fill(bit_hashes->begin(), bit_hashes->end(), 0);
-    } catch(...) {
-        return false;
-    }
-
-    //// Now fill in the hash tables.
+    //// Now fill in the map.
     for (int64_t id = num_blocks; id > 0;) {
-        HashEntry &e = block_hashes->at(--id);
-
-        /// Prepend to linked list for this hash entry
-        uint32_t hash = RsumHash(e); /// get rsum hash.
-        e.next = rsum_mapping->at(hash & hash_mask);
-        rsum_mapping->at(hash & hash_mask) = &e;
-
-        /// And set relevant bit in the bit_hashes to 1
-        bit_hashes->at((hash & bit_hash_mask) >> kBitHashBits) |= 1 << (hash & 7);
-
+        HashEntry *e = &(block_hashes->at(--id));	
+	rsum_map->insert({ e->rsum, e});
     }
     return true;
 }
